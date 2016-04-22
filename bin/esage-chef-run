@@ -1,0 +1,208 @@
+#!/usr/bin/env ruby
+
+# Copyright (C) 2008 Esage Holdings S.L.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+require 'rubygems'
+require 'fileutils'
+require 'rest-client'
+require 'xmlsimple'
+require 'esage-chef-agent'
+require 'logger'
+include Esage::Chef
+
+at_exit do
+  if $!
+    log "BACKTRACE", :error
+    log $!.to_s, :error
+    log $@.to_s, :error
+  end
+end
+
+Log = Logger.new Esage::Chef::Config.log_file
+
+def log(msg, level = :info)
+  if level == :debug and not $DEBUG
+    return
+  end
+  if level == :info
+    Log.info msg.to_s
+  elsif level == :warning
+    Log.warn msg.to_s
+  elsif level == :error
+    Log.error msg.to_s
+  else
+    Log.debug msg.to_s
+  end
+end
+
+CHEF_CONFIG_DIR = Esage::Chef::Config.chef_config_dir 
+BOOTSTRAP_XML =  Esage::Chef::Config.bootstrap_backup_file
+CLIENT_CERT = Esage::Chef::Config.client_cert_file
+
+if File.exist? CLIENT_CERT
+  log "#{CLIENT_CERT} file found. If you want to re-run the Esage Chef Agent,\n" +
+      "delete the #{Esage::Chef::Config.chef_config_dir} directory first.\n" +
+      "Aborting.", :warning
+  exit 1
+end
+
+if not File.directory? CHEF_CONFIG_DIR
+  log "Creating #{CHEF_CONFIG_DIR} directory."
+  FileUtils.mkdir_p '/etc/chef'
+end
+
+#
+# Try to fix system clock with ntpdate
+#
+log "Trying to synchronize system clock"
+`/usr/sbin/ntpdate #{Esage::Chef::Config.ntp_server} > /dev/null 2>&1`
+if $? != 0
+  log "Could not update the system clock using ntpdate and #{Esage::Chef::Config.ntp_server} ntp server", :warning
+end
+
+#
+# Parse info from DCHP client leases file
+#
+log "Parsing leases file"
+leases = Util.parse_leases_file
+if not leases
+  log "Leases file not found or invalid. Current leases search path ['/var/lib/dhcp3', '/var/lib/dhcp', '/var/lib/dhclient', '/var/lib/NetworkManager'].", :error
+  exit 1
+else
+  log "Leases found #{leases.inspect}"
+
+  #
+  # Request node info from Esage API
+  #
+  log "Requesting Chef config from API #{leases[:esage_api_url]} OneTime #{leases[:esage_api_token]} Accept #{Esage::Chef::Config.bootstrap_mediatype}"
+  begin
+    xml = RestClient::Resource.new(
+      leases[:esage_api_url],
+      :verify_ssl => OpenSSL::SSL::VERIFY_NONE
+    ).get(
+      :authorization => "OneTime #{leases[:esage_api_token]}",
+      :accept => Esage::Chef::Config.bootstrap_mediatype
+    )
+  rescue Exception => e
+    log "Error requesting node info from API", :error
+    log e.message, :error
+    log e.backtrace.join("\n    ")
+    exit 1
+  end
+  #
+  # Write the bootstrap XML
+  # Daemon will not run if this XML is found
+  #
+  File.open(BOOTSTRAP_XML, 'w') do |f|
+    f.puts xml
+  end
+
+  #
+  # Parse the XML returned by API
+  #
+  log "Parsing Bootstrap XML from API"
+  begin
+    bootstrap_config = BootstrapConfigParser.new(xml)
+  rescue Exception => e
+    log "Error parsing XML bootstrap file", :error
+    log e.message, :error
+    log e.backtrace.join("\n    ")
+    exit 1
+  end
+
+  #
+  # Write Chef validation pem
+  #
+  File.open(Esage::Chef::Config.validation_cert, 'w') do |f|
+    f.puts bootstrap_config.validation_cert
+  end
+  log "Validation cert written"
+
+  #
+  # Get required node info and write chef-client config file
+  #
+  validation_client_name = bootstrap_config.validation_client_name
+  chef_server_url = bootstrap_config.chef_server_url
+  node_config = bootstrap_config.node_config
+  if node_config['run_list']
+    log "Recipes found #{node_config.inspect}"
+  else
+    log "No recipes selected", :warning
+  end
+  File.open('/etc/chef/client.rb', 'w') do |f|
+    f.puts "log_level        :info"
+    f.puts "log_location     STDOUT"
+    f.puts "chef_server_url  '#{chef_server_url}'"
+    f.puts "ssl_verify_mode  :verify_none"
+    f.puts "validation_client_name '#{validation_client_name}'"
+  end
+
+  #
+  # Write first-boot.json attributes
+  #
+  File.open('/etc/chef/first-boot.json', 'w') do |f|
+    node_config ||= {}
+    f.puts node_config.to_json
+  end
+  log "Written '#{node_config.to_json}' to /etc/chef/first-boot.json file"
+
+
+  #
+  # Set the hostname
+  #
+  node_name = bootstrap_config.node_name
+
+  log "Setting hostname"
+  output = `hostname #{node_name} 2>&1`
+  log output, :info
+
+  net_config_file = '/etc/sysconfig/network'
+  if File.exists? net_config_file
+    log "Configuring /etc/sysconfig/network with the new hostname"
+    data = File.read net_config_file
+    File.open net_config_file, 'w' do |f|
+     data.each_line {|l| l.include?('HOSTNAME') ? f.puts("HOSTNAME=#{node_name}\n") : f.puts(l)}
+    end
+  end
+  File.open('/etc/hostname', 'w') do |f|
+      f.puts node_name
+  end
+  File.open('/etc/hosts', 'a') do |f|
+      f.puts "127.0.0.1         #{node_name}"
+  end
+  log "done"
+
+  #
+  # Everything in place, so run the client
+  cmd = "chef-client -N #{node_name} --once -j /etc/chef/first-boot.json -L /var/log/chef-client.log"
+  log "Running chef-client first time"
+  log cmd
+  output = `#{cmd}`
+  #
+  # Remove validation certs and bootstrap XML
+  #
+  if not ENV['ESAGE_DEBUG']
+    if File.exist?(Esage::Chef::Config.validation_cert)
+      FileUtils.rm(Esage::Chef::Config.validation_cert)
+    end
+    if File.exist?(Esage::Chef::Config.bootstrap_backup_file)
+      FileUtils.rm(Esage::Chef::Config.bootstrap_backup_file)
+    end
+  end
+  if $? != 0
+    log "chef-client run failed", :error
+    log output, :info
+  end
+end
