@@ -10,7 +10,7 @@ Gem::Specification.new do |gem|
   gem.summary         = %Q{Esage Chef Agent}
   gem.description     = %Q{Esage Chef Agent}
   gem.email           = "support@esage.cn"
-  gem.authors         = ["Salvador Girones", "Sergio Rubio", "Serafin Sedano", "Ignasi Barrera"]
+  gem.authors         = ["Sam Yang"]
 
   gem.executables     = ["esage-chef-run"]
   gem.files           = `git ls-files`.split($/)
